@@ -28,7 +28,7 @@ const CONFIG = {
     micDenied: 'Без микрофона тоже можно — просто проведи пальцем по свечам',
     micUnsupported: 'Микрофон тут недоступен — просто проведи пальцем по свечам',
     micInsecure: 'Микрофон работает только когда открытка открыта по https — а пока просто проведи пальцем по свечам',
-    micThreshold: 0.12,          // чувствительность: меньше — легче задуть
+    micSensitivity: 1,           // чувствительность микрофона: 2 — задуть в 2 раза легче, 0.5 — в 2 раза труднее
     doneTitle: 'С днём рождения!',
     doneSub: 'Желание уже в пути ✨'
   },
@@ -90,6 +90,7 @@ const CONFIG = {
 
   music: {
     src: 'music.mp3',            // пустая строка '' — спрятать кнопку
+    autoStart: true,             // включать музыку, когда она открывает конверт (раньше первого касания браузеры не дают)
     volume: 0.7,               // итоговая громкость от 0 до 1 (сам файл уже сделан тише оригинала)
     fadeIn: 4,                   // за сколько секунд музыка плавно нарастает с нуля
     loopStart: 0.5,              // откуда в файле начинается бесшовный круг (сек)
@@ -602,6 +603,7 @@ const nextBtn = $('#nextBtn');
 const ready = new Set();
 const hooks = { enter: {}, leave: {} };
 let cur = 0, lock = false, modalOpen = false, musicOn = false;
+let startMusic = () => {}, duckMusic = () => {};   // задаются в блоке музыки
 
 function ui() {
   [...dots.children].forEach((d, i) => d.classList.toggle('on', i === cur));
@@ -720,14 +722,27 @@ else {
       const t = actx.currentTime;
       gain.gain.cancelScheduledValues(t);
       gain.gain.setValueAtTime(0, t);
-      gain.gain.linearRampToValueAtTime(M.volume, t + M.fadeIn);
+      gain.gain.linearRampToValueAtTime(target(), t + M.fadeIn);
     } else {
       if (!fallback) { fallback = new Audio(M.src); fallback.loop = true; }
       fallback.volume = 0;
       await fallback.play();
-      fadeEl(fallback, M.volume, M.fadeIn);
+      fadeEl(fallback, target(), M.fadeIn);
     }
   }
+  // Пока микрофон слушает свечи, музыка играет еле слышно, чтобы не мешать
+  let ducked = false;
+  const target = () => ducked ? M.volume * 0.12 : M.volume;
+  duckMusic = on => {
+    ducked = on;
+    if (!musicOn) return;
+    if (src) {
+      const t = actx.currentTime;
+      gain.gain.cancelScheduledValues(t);
+      gain.gain.setValueAtTime(gain.gain.value, t);
+      gain.gain.linearRampToValueAtTime(target(), t + 0.4);
+    } else if (fallback && !fallback.paused) fadeEl(fallback, target(), 0.4);
+  };
   function stop() {
     if (src) {
       const s = src, t = actx.currentTime; src = null;
@@ -739,11 +754,15 @@ else {
     if (fallback && !fallback.paused) fadeEl(fallback, 0, 0.5, () => { if (!musicOn) fallback.pause(); });
   }
 
-  musicBtn.addEventListener('click', () => {
-    if (musicOn) { setOn(false); stop(); return; }
+  startMusic = (quiet) => {
+    if (musicOn) return;
     setOn(true);
     if (!Mic.active) setAudioSession('playback');
-    play().catch(() => { setOn(false); stop(); toast(M.errorText); });
+    play().catch(() => { setOn(false); stop(); if (!quiet) toast(M.errorText); });
+  };
+  musicBtn.addEventListener('click', () => {
+    if (musicOn) { setOn(false); stop(); return; }
+    startMusic(false);
   });
 }
 
@@ -752,6 +771,7 @@ const env = $('#envelope'); let envOpened = false;
 env.addEventListener('click', () => {
   if (envOpened) return;
   envOpened = true;
+  if (C.music.autoStart) startMusic(true);
   env.classList.add('open'); $('#envHint').classList.add('gone');
   buzz(12);
   setTimeout(() => { if (cur === IDX.envelope) { ready.add(IDX.envelope); go(IDX.cake); } }, RM ? 900 : 2700);
@@ -847,15 +867,20 @@ const Mic = {
       const buf = new Float32Array(an.fftSize);
       micBtn.classList.add('listening'); micRow.classList.add('listening-on');
       micStatus.textContent = C.cake.micListening;
+      duckMusic(true);
+      // Порог считается от тишины в комнате: первые 0.6 с слушаем фон,
+      // дальше задувание срабатывает, когда звук в ~3 раза громче фона.
+      const sens = C.cake.micSensitivity || 1;
+      const calcThr = floor => Math.min(0.02, Math.max(0.003, floor * 3)) / sens;
       const t0 = performance.now();
-      let noise = 0, ns = 0, level = 0, loud = 0, lastBlow = 0, thr = C.cake.micThreshold;
+      let noise = 0, ns = 0, level = 0, loud = 0, lastBlow = 0, thr = calcThr(0.002);
       const loop = now => {
         if (!this.active) return;
         an.getFloatTimeDomainData(buf);
         let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
         const rms = Math.sqrt(sum / buf.length);
         level = level * 0.6 + rms * 0.4;
-        if (now - t0 < 700) { noise += rms; ns++; thr = Math.max(C.cake.micThreshold, (noise / ns) * 3 + 0.02); }
+        if (now - t0 < 600) { noise += rms; ns++; thr = calcThr(noise / ns); }
         else if (level > thr) {
           loud++;
           if (loud > 3 && now - lastBlow > 70) {
@@ -880,6 +905,7 @@ const Mic = {
     if (this.ctx) { try { this.ctx.close(); } catch (_) {} }
     this.stream = null; this.ctx = null;
     setAudioSession(musicOn ? 'playback' : 'auto');
+    duckMusic(false);
     micBtn.classList.remove('listening'); micRow.classList.remove('listening-on'); meter.style.width = '0';
   }
 };
